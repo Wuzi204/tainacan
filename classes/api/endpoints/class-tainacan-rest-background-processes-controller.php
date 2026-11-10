@@ -1,0 +1,447 @@
+<?php
+
+namespace Tainacan\API\EndPoints;
+
+defined( 'ABSPATH' ) or die( 'No script kiddies please!' );
+
+use \Tainacan\API\REST_Controller;
+use Tainacan\Repositories;
+use Tainacan\Entities;
+
+/**
+ * REST API controller for managing Tainacan background processes.
+ *
+ * Handles all REST API endpoints for background process operations including
+ * process monitoring, status checking, and process management.
+ *
+ * @since 1.0.0
+ */
+class REST_Background_Processes_Controller extends REST_Controller {
+    
+    /**
+	 * table
+	 *
+	 * @var String
+	 * @access protected
+	 */
+    private $table;
+
+    protected function get_schema() {
+        return "TODO:get_schema";
+    }
+
+	/**
+	 * REST_Background_Processes_Controller constructor.
+	 * Define the namespace, rest base and instantiate your attributes.
+	 */
+	public function __construct(){
+        global $wpdb;
+        $this->rest_base = 'bg-processes';
+        $this->table = $wpdb->prefix . 'tnc_bg_process';
+		parent::__construct();
+    }
+
+
+	/**
+	 * Register the BG Processes route and their endpoints
+	 */
+	public function register_routes(){
+        register_rest_route($this->namespace, '/' . $this->rest_base , array(
+	        array(
+		        'methods'             => \WP_REST_Server::READABLE,
+		        'callback'            => array($this, 'get_items'),
+		        'permission_callback' => array($this, 'bg_processes_permissions_check'),
+		        'args'                => [
+                    'user_id' => [
+                        'type'        => 'integer',
+                        'description' => __( 'The ID of the owner of the background processes. Defaults to current user', 'tainacan' ),
+                    ],
+                    'all_users' => [
+                        'type'        => 'boolean',
+                        'description' => __( 'Whether to return processes from all users (if current user is admin).', 'tainacan' ),
+                        'default'     => false,
+                    ],
+                    'status' => [
+                        'type'        => 'string',
+                        'description' => __( '"open" returns only processes currently running. "closed" returns only finished or aborted. "all" returns all.', 'tainacan' ),
+                        'default'     => 'all',
+                        'enum'        => array(
+                            'open',
+                            'closed',
+                            'all'
+                        )
+                    ],
+                    'perpage' => [
+                        'type'        => 'integer',
+                        'description' => __( 'Number of processes to return per page', 'tainacan' ),
+                        'default'     => 10,
+                    ],
+                    'paged' => [
+                        'type'        => 'integer',
+                        'description' => __( 'Page to retrieve', 'tainacan' ),
+                        'default'     => 1
+                    ],
+					'recent' => [
+                        'type'        => 'boolean',
+                        'description' => __( 'Returns only processes created or updated recently', 'tainacan' ),
+                        'default' => false
+                    ],
+                ],
+	        ),
+        ));
+        register_rest_route($this->namespace, '/' . $this->rest_base . '/(?P<id>[0-9]+)', array(
+            array(
+                'methods'             => \WP_REST_Server::READABLE,
+                'callback'            => array($this, 'get_item'),
+                'permission_callback' => array($this, 'bg_processes_permissions_check'),
+            ),
+
+        ));
+        register_rest_route($this->namespace, '/' . $this->rest_base . '/(?P<id>[0-9]+)', array(
+            array(
+                'methods'             => \WP_REST_Server::EDITABLE,
+                'callback'            => array($this, 'update_item'),
+                'permission_callback' => array($this, 'bg_processes_permissions_check'),
+                'args'                => [
+                    'status' => [
+                        'type'        => 'string',
+                        'description' => __( '"open" or "closed" ', 'tainacan' ),
+                        'enum'    	  => array(
+                            'open',
+                            'closed'
+                        )
+                    ]
+                ],
+            ),
+
+        ));
+        register_rest_route($this->namespace, '/' . $this->rest_base . '/(?P<id>[0-9]+)', array(
+            array(
+                'methods'             => \WP_REST_Server::DELETABLE,
+                'callback'            => array($this, 'delete_item'),
+                'permission_callback' => array($this, 'bg_processes_permissions_check'),
+
+            ),
+
+        ));
+        register_rest_route($this->namespace, '/' . $this->rest_base . '/file', array(
+            array(
+                'methods'             => \WP_REST_Server::READABLE,
+                'callback'            => array($this, 'get_file'),
+                'permission_callback' => array($this, 'bg_processes_permissions_check'),
+            ),
+
+        ));
+    }
+
+
+	/**
+	 *
+	 * @param \WP_REST_Request $request
+	 *
+	 * @return bool|\WP_Error
+	 * @throws \Exception
+	 */
+	public function  bg_processes_permissions_check($request) {
+        return current_user_can('manage_tainacan');
+	}
+
+    public function get_items( $request ) {
+        global $wpdb;
+
+        $perpage = isset($request['perpage']) && is_numeric($request['perpage']) ? (int) $request['perpage'] : 10;
+        if ($perpage < 1) {
+            $perpage = 1;
+        }
+        if ($perpage > 100) {
+            $perpage = 100;
+        }
+        $paged = isset($request['paged']) && is_numeric($request['paged']) ? (int) $request['paged'] : 1;
+        if ($paged < 1) {
+            $paged = 1;
+        }
+
+        $offset = ($paged - 1) * $perpage;
+
+        $limit_q = $wpdb->prepare("LIMIT %d, %d", $offset, $perpage);
+
+        $user_q = $wpdb->prepare("AND user_id = %d", get_current_user_id());
+        $status_q = "";
+
+        $date_range = '';
+
+        if (current_user_can('edit_users')) {
+            if (isset($request['user_id'])) {
+                $user_q = $wpdb->prepare("AND user_id = %d", $request['user_id']);
+            }
+
+            if ( isset($request['all_users']) && $request['all_users'] ) {
+                $user_q = "";
+            }
+        }
+
+        if ( isset($request['status']) && $request['status'] != 'all' ) {
+            if ( $request['status'] == 'open' ) {
+                $status_q = "AND done = 0";
+            }
+            if ( $request['status'] == 'closed' ) {
+                $status_q = "AND done = 1";
+            }
+        }
+
+        if (isset($request['datequery'])) {
+            $from = $request['datequery'][0]['after'];
+            $to = $request['datequery'][0]['before'];
+            $date_range = $wpdb->prepare("AND processed_last >= %s AND processed_last <= %s", $from, $to);
+        }
+
+        $process_type = '';
+        if (isset($request['search'])) {
+            $name = $request['search'];
+            $search_term_like = '%' . $wpdb->esc_like($name) . '%';
+            $process_type = $wpdb->prepare("AND name LIKE %s", $search_term_like);
+        }
+
+		$recent_q = '';
+		if ( isset($request['recent']) && $request['recent'] !== false ) {
+            $recent_q = "AND (processed_last >= NOW() - INTERVAL 10 MINUTE OR queued_on >= NOW() - INTERVAL 10 MINUTE)";
+        }
+
+        $base_query = "FROM $this->table WHERE 1=1 $status_q $user_q $recent_q $date_range $process_type ORDER BY priority DESC, queued_on DESC";
+
+        $query = "SELECT * $base_query $limit_q";
+        $count_query = "SELECT COUNT(ID) $base_query";
+
+        // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Queries only contain the table name, fixed SQL fragments and fragments built with $wpdb->prepare().
+        $result = $wpdb->get_results($query);
+        $total_items = $wpdb->get_var($count_query);
+        // phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+        $response = [];
+
+        foreach ($result as $r) {
+            $response[] = $this->prepare_item_for_response($r, $request);
+        }
+
+        $rest_response = new \WP_REST_Response( $response, 200 );
+
+        $max_pages = ceil($total_items / (int) $perpage);
+
+		$rest_response->header('X-WP-Total', (int) $total_items);
+        $rest_response->header('X-WP-TotalPages', (int) $max_pages);
+
+        return $rest_response;
+    }
+
+    public function get_item( $request ) {
+        global $wpdb;
+        $id = $request['id'];
+
+        $user_q = $wpdb->prepare("AND user_id = %d", get_current_user_id());
+        $id_q = $wpdb->prepare("AND ID = %d", $id);
+
+        if (current_user_can('edit_users')) {
+            if ( isset($request['all_users']) && $request['all_users'] ) {
+                $user_q = "";
+            }
+        }
+
+        $query = "SELECT * FROM $this->table WHERE 1=1 $id_q $user_q LIMIT 1";
+
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $query only contains the table name and fragments built with $wpdb->prepare().
+        $result = $wpdb->get_row($query);
+
+        if ( ! $result ) {
+            return new \WP_REST_Response([
+                'error_message' => __('Process not found', 'tainacan'),
+            ], 404);
+        }
+
+        $result = $this->prepare_item_for_response($result, $request);
+
+        return new \WP_REST_Response( $result, 200 );
+    }
+
+    public function prepare_item_for_response($item, $request) {
+        $key_log = $item->bg_uuid ?? $item->ID;
+        $item->log = $this->get_log_url($key_log, $item->action);
+        $item->error_log = $this->get_log_url($key_log, $item->action, 'error');
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $item->output = $item->output ?? '';
+        $item->output = str_replace("&_wpnonce=[nonce]", "&_wpnonce=$nonce", $item->output);
+        return $item;
+    }
+
+    public function update_item( $request ) {
+        global $wpdb;
+        $id = (int) $request['id'];
+        $body = json_decode($request->get_body(), true);
+
+        $allowed_statuses = [
+            'open'            => [ 'done' => 0, 'status' => '' ],
+            'closed'          => [ 'done' => 1, 'status' => 'cancelled' ],
+            'waiting'         => [ 'done' => 1, 'status' => 'waiting' ],
+            'running'         => [ 'done' => 1, 'status' => 'running' ],
+            'paused'          => [ 'done' => 1, 'status' => 'paused' ],
+            'cancelled'       => [ 'done' => 1, 'status' => 'cancelled' ],
+            'errored'         => [ 'done' => 1, 'status' => 'errored' ],
+            'finished'        => [ 'done' => 1, 'status' => 'finished' ],
+            'finished-errors' => [ 'done' => 1, 'status' => 'finished-errors' ],
+        ];
+
+        if ( ! isset($body['status']) || ! isset($allowed_statuses[$body['status']]) ) {
+            return new \WP_REST_Response([
+                'error_message' => __('Status must be specified', 'tainacan' ),
+                'session_id' => $id
+            ], 400);
+        }
+
+        $where = [ 'ID' => $id ];
+        $where_format = [ '%d' ];
+
+        if ( ! current_user_can('edit_users') || ! isset($request['all_users']) || ! $request['all_users'] ) {
+            $where['user_id'] = get_current_user_id();
+            $where_format[] = '%d';
+        }
+
+        $id_q = $wpdb->prepare("AND ID = %d", $id);
+        $user_q = '';
+        if ( isset($where['user_id']) ) {
+            $user_q = $wpdb->prepare("AND user_id = %d", $where['user_id']);
+        }
+
+        $query = "SELECT * FROM $this->table WHERE 1=1 $id_q $user_q LIMIT 1";
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $query only contains the table name and fragments built with $wpdb->prepare().
+        $result = $wpdb->get_row($query);
+
+        if ( ! $result ) {
+            return new \WP_REST_Response([
+                'error_message' => __('Process not found', 'tainacan'),
+            ], 404);
+        }
+
+        if ( $body['status'] === 'closed' && $result->action === 'import' ) {
+            $background_importer = new \Tainacan\Background_Importer();
+            $background_importer->close( $result->ID, 'cancelled' );
+        } else {
+            $update_data = $allowed_statuses[$body['status']];
+            if ( $update_data['status'] === '' ) {
+                $update_data = [ 'done' => 0 ];
+                $update_format = [ '%d' ];
+            } else {
+                $update_format = [ '%d', '%s' ];
+            }
+
+            $wpdb->update( $this->table, $update_data, $where, $update_format, $where_format );
+        }
+
+        $query = "SELECT * FROM $this->table WHERE 1=1 $id_q $user_q LIMIT 1";
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $query only contains the table name and fragments built with $wpdb->prepare().
+        $result = $wpdb->get_row($query);
+
+        $result = $this->prepare_item_for_response($result, $request);
+
+        return new \WP_REST_Response( $result, 200 );
+    }
+
+    public function delete_item( $request ) {
+        global $wpdb;
+        $id = (int) $request['id'];
+
+        $user_q = $wpdb->prepare("AND user_id = %d", get_current_user_id());
+        $id_q = $wpdb->prepare("AND ID = %d", $id);
+
+        if (current_user_can('edit_users')) {
+            if ( isset($request['all_users']) && $request['all_users'] ) {
+                $user_q = "";
+            }
+        }
+
+        $query = "DELETE FROM $this->table WHERE 1=1 $id_q $user_q LIMIT 1";
+
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $query only contains the table name and fragments built with $wpdb->prepare().
+        $result = $wpdb->query($query);
+
+        return new \WP_REST_Response( $result, 200 );
+    }
+
+    public function get_log_url($id, $action, $type = '') {
+        $suffix = $type ? '-' . $type : '';
+
+        $filename = 'bg-' . $action . '-' . $id . $suffix . '.log';
+
+        $upload_url = wp_upload_dir();
+
+        if (!file_exists( $upload_url['basedir'] . '/tainacan/' . $filename )) {
+            return null;
+        }
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $logs_url = esc_url_raw( rest_url() ) . "tainacan/v2/bg-processes/file?guid=$filename&_wpnonce=$nonce";
+        return $logs_url;
+    }
+
+    public function get_file( $request ) {
+        if( !isset($request['guid']) )  {
+            return new \WP_REST_Response([
+                'error_message' => __('guid must be specified', 'tainacan' )
+            ], 400);
+        }
+
+        $guid = $request['guid'];
+
+        // Reject traversal/absolute-path attempts outright, regardless of what realpath() later resolves.
+        if ( strpos($guid, '..') !== false || preg_match('#^([a-zA-Z]:)?[\\\\/]#', $guid) ) {
+            $error_def = [
+                "code" => "unauthorized_file_path",
+                "message" => "Unauthorized file path",
+                "data" => [ "status" => 403 ],
+            ];
+            return new \WP_REST_Response($error_def, 403, array('content-type' => 'application/json; charset=utf-8'));
+        }
+
+        $upload_url = wp_upload_dir();
+        $base_dir = realpath($upload_url['basedir'] . '/tainacan');
+
+        if ( $base_dir === false ) {
+            return new \WP_REST_Response([
+                'error_message' => __('Base directory not found', 'tainacan' )
+            ], 404);
+        }
+
+        $path = $base_dir . '/' . $guid;
+        $real_file_path = realpath($path);
+
+        // The resolved target must live inside the resolved base directory, not just share a string prefix with it.
+        if ( $real_file_path === false || strpos($real_file_path, $base_dir . DIRECTORY_SEPARATOR) !== 0 ) {
+            $error_def = [
+                "code" => "unauthorized_file_path",
+                "message" => "Unauthorized file path",
+                "data" => [ "status" => 403 ],
+            ];
+            return new \WP_REST_Response($error_def, 403, array('content-type' => 'application/json; charset=utf-8'));
+        }
+
+        if ( file_exists( $real_file_path ) ) {
+            $finfo = @finfo_open(FILEINFO_MIME_TYPE);
+            $mime_type = @finfo_file($finfo, $real_file_path);
+            $file_name = basename($real_file_path);
+            http_response_code(200);
+            header('Content-Description: File Transfer');
+            header('Content-Disposition: attachment; filename="' . $file_name . '"');
+            header("Content-Type: $mime_type");
+            header("Content-Length: " . @filesize( $real_file_path ));
+            if (\ob_get_level() > 0) {
+                \ob_clean();
+            }
+            \flush();
+            // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_readfile -- Stream the log file to the response. WP_Filesystem::get_contents() would load the whole file into memory.
+            \readfile($real_file_path);
+            exit;
+        } else {
+            return new \WP_REST_Response([
+                'error_message' => __('File not found', 'tainacan')
+            ], 404);
+        }
+    }
+
+}
